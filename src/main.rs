@@ -1,135 +1,144 @@
-use std::fmt;
-use std::error::Error;
+#![allow(dead_code)]
 
+use std::io;
+use std::io::{prelude::*, BufReader};
+use std::net::TcpStream;
+use std::thread::sleep;
+use std::time::Duration;
 
-type MQTTTwoBytes = u16;
+pub mod packets;
+pub mod types;
 
+fn encode_variable_byte_int(value: u32) -> Vec<u8> {
+    let mut x = value;
+    let mut v: Vec<u8> = vec![];
 
-struct MQTTString {
-    len: MQTTTwoBytes,
-    data: String
-}
-
-impl MQTTString {
-    fn from(s: String) -> Option<Self> {
-        if s.len() <= u16::MAX as usize {
-            Some(MQTTString{len: s.len() as u16, data: s})
-        } else {
-            None
+    loop {
+        let mut b: u8 = (x % 128).try_into().unwrap();
+        x /= 128;
+        if x > 0 {
+            b |= 0b10000000;
         }
-
+        v.push(b);
+        if x == 0 {
+            break;
+        }
     }
+    v
 }
 
-struct VarByte {
-    data: Vec<u8>
+
+fn encode_string(value: &str) -> Vec<u8> {
+    let len = (value.len() as u16).to_be_bytes();
+    let mut bytes: Vec<u8> = vec![len[0], len[1]];
+    for x in value.as_bytes() {
+        bytes.push(*x)
+    }
+
+    bytes
 }
 
 #[derive(Debug)]
-struct ParseVarByteError;
+struct FixedHeader {
+    packet_type: u8,
+    remaining_length: u32,
+}
 
-impl fmt::Display for ParseVarByteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "could not parse into VarByte")
+impl FixedHeader {
+    fn read(mut stream: TcpStream) -> io::Result<FixedHeader> {
+        let mut buf_reader = BufReader::new(&mut stream);
+        let mut header_bytes= [0u8; 32]; // Max size for fixed header is 6 bytes
+        let bytes_read = buf_reader.read(&mut header_bytes[..])?;
+        dbg!(bytes_read);
+
+        let packet_type = (header_bytes[0] & 0xF0) >> 4; // Only the 4 most significant bits are used to determine the packet type
+
+        Ok(FixedHeader{ packet_type, remaining_length: 0 })
+
     }
 }
 
-impl Error for ParseVarByteError {}
 
-impl From<u32> for VarByte {
-    fn from(value: u32) -> Self {
-        let mut x = value;
-        let mut v: Vec<u8> = vec![];
+struct ConnectPacket<'a>
+ {
+    fh: FixedHeader,
+    protocol_name: &'a str,
+    protocol_version: u8,
+    flags: u8,
+    keepalive: u16,
+    client_identifier: &'a str,
+    will_topic: &'a str,
+    will_message: &'a [u8],
+    username: &'a str,
+    password: &'a str,
+}
 
-        loop {
-
-            let mut b: u8 = (x % 128).try_into().unwrap();
-            x /= 128;
-            if x > 0 {
-                b |= 0b10000000;
-            }
-            v.push(b);
-            if x == 0 { break; }
+impl ConnectPacket<'_> {
+    fn new_simple() -> Self {
+        ConnectPacket {
+            fh: FixedHeader {
+                packet_type: 1 << 4,
+                remaining_length: 0,
+            },
+            protocol_name: "MQTT",
+            protocol_version: 4u8,
+            flags: 0,
+            keepalive: 60,
+            client_identifier: "cutie-tea1234",
+            will_topic: "",
+            will_message: "".as_bytes(),
+            username: "",
+            password: "",
         }
+    }
 
-        VarByte { data: v }
+    fn pack(mut self) -> Vec<u8> {
+        let mut body = vec![];
+        body.extend(encode_string(self.protocol_name));
+        body.push(self.protocol_version);
+        body.push(self.flags);
+        body.push((self.keepalive >> 8) as u8);
+        body.push(self.keepalive as u8);
+        body.extend(encode_string(self.client_identifier));
+
+        self.fh.remaining_length = body.len() as u32;
+        let mut bytes = vec!(self.fh.packet_type );
+        bytes.extend(encode_variable_byte_int(self.fh.remaining_length));
+        bytes.extend(body);
+
+        bytes
     }
 }
-
-impl From<VarByte> for u32 {
-    fn from(value: VarByte) -> Self {
-        let mut multiplier = 1;
-        let mut v: u32 = 0;
-        let mut b: u32;
-        let mut i = 0;
-
-        loop {
-            b = value.data[i] as u32;
-            v += (b & 127) * multiplier;
-            if multiplier > 128*128*128 {
-                // TODO: Error handling?
-            }
-            multiplier *= 128;
-            i += 1;
-            if (b & 128) == 0 { break; }
-        }
-
-        v
-    }
-}
-
 
 fn main() {
-}
+    let mut stream = TcpStream::connect("127.0.0.1:1883").unwrap();
+    let connect_packet = ConnectPacket::new_simple();
 
-#[cfg(test)]
-mod tests {
-    use crate::{MQTTString, VarByte};
+    
+    //stream.write(connect_packet.pack().as_slice()).unwrap();
+    stream.write_all(connect_packet.pack().as_slice());
+    stream.flush();
+    // sleep(Duration::from_secs(1));
+    // let fh = FixedHeader::read(stream);
+    // dbg!(fh.unwrap());
 
-    #[test]
-    fn create_string() {
-        let s = MQTTString::from(String::from("Hello world")).unwrap();
-        assert_eq!(s.len, 11u16);
-        assert_eq!(s.data, String::from("Hello world"));
-    }
+    let mut buf_reader = BufReader::new(&mut stream);
+    let mut header_bytes= [0u8; 2]; // Max size for fixed header is 6 bytes
+    let bytes_read = buf_reader.read(&mut header_bytes[..]).unwrap();
+    dbg!(bytes_read);
 
-    #[test]
-    fn create_invalid_string() {
-        let single_string = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
-        let long_string = single_string.repeat(100000);
+    let packet_type = (header_bytes[0] & 0xF0) >> 4; // Only the 4 most significant bits are used to determine the packet type
+    dbg!(packet_type);
 
-        let s = MQTTString::from(long_string);
-        assert!(s.is_none());
-    }
+    let remaining_bytes = if (header_bytes[1] >> 7) == 0 {
+        header_bytes[1]
+    } else {
+        128
+    } as u64;
 
-    #[test]
-    fn single_byte_var_byte() {
-        let v = VarByte::from(127);
-        assert_eq!(1, v.data.len());
-        assert_eq!(127, v.data[0]);
-    }
+    dbg!(remaining_bytes);
 
-    #[test]
-    fn two_bytes_var_byte() {
-        let v = VarByte::from(128);
-        assert_eq!(2, v.data.len());
-        assert_eq!(128, v.data[0]);
-        assert_eq!(1, v.data[1]);
-    }
-
-    #[test]
-    fn four_bytes_var_byte() {
-        let v = VarByte::from(268_435_455);
-        assert_eq!(4, v.data.len());
-        assert_eq!(255, v.data[0]);
-        assert_eq!(255, v.data[1]);
-        assert_eq!(255, v.data[2]);
-        assert_eq!(127, v.data[3]);
-    }
-
-    #[test]
-    fn u32_from_varbyte() {
-        let u = u32::from(VarByte::from(1234567));
-        assert_eq!(1234567u32, u)
-    }
+    let mut remaining_data = Vec::new();
+    buf_reader.take(remaining_bytes).read_to_end(&mut remaining_data);
+    dbg!(remaining_data);
 }
